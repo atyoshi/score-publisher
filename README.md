@@ -6,8 +6,8 @@ A local Mac app for selecting MuseScore pieces, preparing score videos, previewi
 
 - macOS
 - Python 3 (standard library only; no pip packages)
-- MuseScore Studio 4, available at `/Applications/MuseScore 4.app`
-- FFmpeg on your `PATH`
+- MuseScore Studio 4.7 or newer, available at `/Applications/MuseScore 4.app`
+- FFprobe on your `PATH`, and compatible FFmpeg shared libraries configured in MuseScore (see below)
 - A Google Cloud project with YouTube Data API v3 enabled, plus a Desktop OAuth client, if you want to upload or check your channel
 
 The app defaults to `~/Music/Scores`. Use **Choose folder** in the app to select a different folder.
@@ -33,7 +33,18 @@ OAuth credentials, upload state, logs, and generated videos remain local in `.da
 
 ## Rendering notes
 
-The app renders 1920 × 1080 score videos with FFmpeg using MuseScore score-page, timing, and audio exports. The active measure is outlined in blue. Audio uses MuseScore Basic. This does not reproduce MuseScore.com's scrolling presentation or Muse Sounds playback. Preview videos before publication, especially for unusual layouts or complex playback. The app does not modify original score files.
+The app uses MuseScore's native exporter to create 1920 × 1080 videos at 30 fps with a moving blue playback cursor. It selects Muse Sounds on a temporary score copy, then exports that copy. Available instrument libraries are used automatically; unsupported or missing sounds fall back to MS Basic. Original scores are never changed. The native layout shows full pages and advances between them; it does not continuously scroll like the cloud player.
+
+MuseScore 4.7 needs FFmpeg shared libraries from versions 4–8. FFmpeg 9 alone causes its native exporter to crash. On Apple Silicon Macs, install `ffmpeg@8` alongside your default FFmpeg and configure MuseScore:
+
+```sh
+brew install ffmpeg@8
+defaults write org.musescore.MuseScore4 application.ffmpegLibsDir -string /opt/homebrew/opt/ffmpeg@8/lib
+```
+
+This Mac is already configured. Reopen MuseScore if it was running before configuration. The app checks for compatible libraries before starting an export.
+
+Older generated videos stay available to preview but are marked for upgrade. Select them and click **Prepare videos**, or use **Upgrade this video** in Preview. New videos use a separate filename, and the old files remain on disk. Attached videos and videos with completed or resumable upload records are preserved. Sound or mixer changes in a score are detected when you refresh the folder. Preview the result before publication.
 
 Alternatively, export an MP4 in MuseScore and attach it from the score preview.
 

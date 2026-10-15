@@ -25,11 +25,28 @@ Selections and edits persist across app restarts and folder changes. Completed v
 
 ## Video appearance and sound
 
-Automatic rendering creates **1920 × 1080 MP4s**, showing the current score system with a blue outline around the active measure. System changes follow MuseScore's playback timing, including the repeats present in that timing export. Audio uses **MuseScore Basic**. This is a custom system-view renderer; it does not reproduce MuseScore.com's scrolling presentation or Muse Sounds playback.
+Automatic rendering creates native **1920 × 1080, 30 fps MP4s** with a moving blue playback cursor. Full score pages advance with the music. This is MuseScore's native page view, rather than the cloud player's continuous scrolling.
 
-The installed MuseScore's native command-line MP4 export crashed during testing. The app therefore uses its working score-page, timing, and audio exports with FFmpeg. It never changes your original score files.
+The app selects **Muse Sounds** on a temporary copy before exporting the video. Installed matching libraries provide the instrument sounds; missing or unsupported instruments fall back to MS Basic. This includes scores imported from MusicXML. It never changes your original scores.
 
-If you prefer MuseScore's native video layout or sound, export an MP4 in MuseScore and use **Preview → Attach a video exported in MuseScore**. Paste that MP4's full local path. The app copies it into its Videos folder and validates that it has audio and video.
+### Video setup
+
+MuseScore Studio **4.7 or newer** is required. Studio 4.7 supports FFmpeg shared libraries through version 8; having only FFmpeg 9 makes the native exporter crash. This Mac has already been configured with FFmpeg 8 alongside the default version 9. For another Apple Silicon Mac:
+
+```sh
+brew install ffmpeg@8
+defaults write org.musescore.MuseScore4 application.ffmpegLibsDir -string /opt/homebrew/opt/ffmpeg@8/lib
+```
+
+Reopen MuseScore if it was already running. Keep FFprobe installed for video validation. Score Publisher checks for compatible libraries before invoking the native exporter and reports export errors in Preview, with the diagnostic log filename.
+
+### Upgrading existing videos
+
+Older automatically generated videos are labeled **Older video · prepare to upgrade**. They remain viewable, but need upgrading before a new upload. Use **Prepare videos** for your selected pieces, or **Upgrade this video** in Preview. The new native video is saved under a different filename, leaving the old file on disk. Videos already uploaded or associated with an interrupted upload retain their original media and upload records.
+
+Videos attached through Preview are reused. Attachments saved by older versions lack a source label; clicking Prepare on those creates a native replacement while leaving the old file on disk. Sound and mixer changes are detected when you **Refresh** the score folder.
+
+You can still export an MP4 yourself and use **Preview → Attach a video exported in MuseScore**. Paste that MP4's full local path. The app copies it into its Videos folder and validates that it has audio and video.
 
 Preview the result before publication, especially for unusual layouts, multi-movement works, or scores with complex playback. Composition dates and copied scores always need your judgment.
 
@@ -60,7 +77,7 @@ Your credentials and saved authorization are stored locally in **.data** with re
 
 ## Verification performed
 
-Core score discovery, preview, rendering, description validation, and upload recovery flows were exercised locally. No real YouTube upload was performed; Google credentials and authorization must be supplied by you.
+Core score discovery, preview, rendering, description validation, and upload recovery flows were exercised locally. The native switch passed 10 regression checks and two real video upgrades through the app queue, including audio/video validation, playback range requests, cache reuse, and preservation of original files and upload records. No real YouTube upload was performed; Google credentials and authorization must be supplied by you.
 
 Official references: [MuseScore command-line export](https://handbook.musescore.org/appendix/command-line-usage), [Google desktop authorization](https://developers.google.com/identity/protocols/oauth2/native-app), [YouTube resumable uploads](https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol).
 

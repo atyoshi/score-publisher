@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Local MuseScore → YouTube workbench. Python standard library only."""
 import base64, calendar, copy, hashlib, html, json, mimetypes, os, pathlib, queue, re, secrets, shutil, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, webbrowser, zipfile
-import xml.etree.ElementTree as ET
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from discovery import DIRECT, discover, xml_data, title_matches
+from native_video import RENDERER, export_native
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DATA = ROOT / '.data'
@@ -58,11 +59,11 @@ def scan(folder):
             date = (tags.get('creationDate') or '')[:7]
             try: month(date)
             except ValueError: date = ''
-            base = {'id': ident, 'path': str(path), 'filename': path.name, 'title': path.stem, 'composer': tags.get('composer') or 'Unknown composer', 'month': date, 'dateSource': 'Score creation date' if date else 'Date needed', 'hash': digest, 'selected': False, 'status': 'Not prepared', 'error': ''}
+            base = {'id': ident, 'path': str(path), 'filename': path.name, 'title': path.stem, 'composer': tags.get('composer') or 'Unknown composer', 'month': date, 'dateSource': 'Score creation date' if date else 'Date needed', 'hash': digest, 'sourceHash': file_fingerprint(path), 'selected': False, 'status': 'Not prepared', 'error': ''}
             with LOCK:
                 old = STATE['pieces'].get(ident, {})
                 if old.get('hash') == digest:
-                    base.update({k: old[k] for k in ('title','month','selected','order','checkedMatches','status','error','video','youtube','session','uploadMeta') if k in old})
+                    base.update({k: old[k] for k in ('title','month','selected','order','checkedMatches','status','error','video','videoSource','videoRenderer','videoSourceHash','youtube','session','uploadMeta') if k in old})
                     if (base['status'] in ('Rendering', 'Encoding video', 'Queued') or base['status'].startswith('Uploading')) and ident not in BUSY: base['status'] = 'Interrupted — retry'
                 elif old.get('youtube'):
                     base['youtube'] = old['youtube']
@@ -85,8 +86,19 @@ def update(ident, **values):
         STATE['pieces'][ident].update(values)
         save()
 
+def file_fingerprint(path):
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+def generated_video_path(row):
+    return VIDEOS / (row['id'] + '-' + row['hash'][:12] + '-' + RENDERER + '.mp4')
+
 def video_path(row):
-    return VIDEOS / (row['id'] + '-' + row['hash'][:12] + '.mp4')
+    return pathlib.Path(row['video']) if row.get('video') else generated_video_path(row)
+
+def needs_native_video(row):
+    if not row.get('video') or not video_path(row).is_file(): return True
+    if row.get('videoSource') == 'attached' or row.get('youtube') or row.get('session'): return False
+    return row.get('videoRenderer') != RENDERER or row.get('videoSourceHash') != row.get('sourceHash')
 
 def validate_video(path):
     probe = shutil.which('ffprobe') or '/opt/homebrew/bin/ffprobe'
@@ -97,94 +109,36 @@ def validate_video(path):
         raise ValueError('The exported file must contain both video and audio.')
 
 def render(row):
-    """Render timed score systems with measure highlights; no native MP4 dependency."""
-    import struct
-    target = video_path(row)
-    if target.exists():
-        validate_video(target)
-        update(row['id'], video=str(target), status='Ready', error='')
+    """Export a native playback video on a copy, preserving the previous video on failure."""
+    if STOP.is_set(): raise ValueError('Stopped. Retry to prepare this video.')
+    if row.get('youtube') or row.get('session'):
+        raise ValueError('This video has an upload record. Its video is preserved for upload recovery.')
+    if not needs_native_video(row):
+        validate_video(video_path(row))
+        update(row['id'], status='Ready', error='')
         return
-    work = DATA / ('render-' + row['id'] + '-' + row['hash'][:12])
-    work.mkdir(exist_ok=True)
+    target = generated_video_path(row)
     partial = target.with_name(target.stem + '.partial.mp4')
     log = DATA / (row['id'] + '.log')
-    env = dict(os.environ)
-    env['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + env.get('PATH','')
-    ffmpeg = shutil.which('ffmpeg', path=env['PATH'])
-    ffprobe = shutil.which('ffprobe', path=env['PATH'])
-    if not ffmpeg or not ffprobe: raise ValueError('Install FFmpeg to prepare videos.')
     update(row['id'], status='Rendering', error='')
-    def run(cmd):
-        if STOP.is_set(): raise ValueError('Stopped. Retry to prepare this video.')
-        with log.open('a') as out:
-            result = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, env=env, timeout=7200)
-        return result.returncode
-    audio, positions = work / 'audio.mp3', work / 'score.mpos'
-    # Each export is isolated; certain MuseScore builds crash during batch teardown.
-    if not audio.exists():
-        run([MUSE, '--sound-profile', 'MuseScore Basic', '-o', str(audio), row['path']])
-    if not positions.exists(): run([MUSE, '-r', '150', '-o', str(positions), row['path']])
-    if not (work/'page-1.png').exists(): run([MUSE, '-r', '150', '-o', str(work/'page.png'), row['path']])
-    if not audio.exists() or not positions.exists() or not (work/'page-1.png').exists():
-        raise ValueError('MuseScore could not export audio, score pages, or timing. Export an MP4 in MuseScore and attach it in Preview. See ' + log.name)
-    probe = subprocess.run([ffprobe,'-v','error','-show_entries','format=duration','-of','json',str(audio)],capture_output=True,timeout=30)
-    duration = float(json.loads(probe.stdout)['format']['duration'])
-    root = ET.parse(positions).getroot()
-    elements = {el.get('id'):el.attrib for el in root.findall('./elements/element')}
-    events = [(float(el.get('position'))/1000, elements[el.get('elid')]) for el in root.findall('./events/event')]
-    events.sort(key=lambda e:e[0])
-    if not events: raise ValueError('This score has no playback timing data.')
-    # Group measures sharing a system; the events include played repeats.
-    segments = []
-    for start, el in events:
-        key = (int(el['page']), round(float(el['y']),1))
-        if not segments or segments[-1]['key'] != key:
-            segments.append({'key':key,'start':start,'events':[]})
-        segments[-1]['events'].append((start,el))
-    segments[0]['start'] = 0
-    filters = []
-    concat = []
-    with log.open('w') as out: out.write('Score-system renderer · MuseScore Basic audio\n')
-    for i,seg in enumerate(segments):
-        page,y = seg['key']
-        source = work / f'page-{page+1}.png'
-        with source.open('rb') as f:
-            header=f.read(24)
-        width,height=struct.unpack('>II',header[16:24])
-        # Position export uses twelve coordinate units per pixel at the chosen DPI.
-        ratio=1/12
-        top = 0 if page==0 and y==segments[0]['key'][1] else max(0,int(y*ratio)-85)
-        bottom=min(height,int(max(float(el['y'])+float(el['sy']) for _,el in seg['events'])*ratio)+100)
-        cropheight=max(2,bottom-top)
-        scale=min(1800/width,900/cropheight)
-        outw=max(2,int(width*scale)//2*2)
-        outh=max(2,int(cropheight*scale)//2*2)
-        image=work/f'system-{i}.png'
-        vf=f'crop={width}:{cropheight}:0:{top},scale={outw}:{outh},pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=white,setsar=1'
-        if run([ffmpeg,'-v','error','-y','-i',str(source),'-vf',vf,'-frames:v','1',str(image)]): raise ValueError('Could not render a score system. See '+log.name)
-        end=segments[i+1]['start'] if i+1<len(segments) else duration
-        if end <= seg['start']: raise ValueError('Invalid score timing.')
-        concat.extend([f"file '{image.name}'",f"duration {end-seg['start']:.6f}"])
-        for j,(start,el) in enumerate(seg['events']):
-            stop=seg['events'][j+1][0] if j+1<len(seg['events']) else end
-            x=(1920-outw)/2+float(el['x'])*ratio*outw/width
-            yy=(1080-outh)/2+(float(el['y'])*ratio-top)*outh/cropheight
-            w=float(el['sx'])*ratio*outw/width
-            h=float(el['sy'])*ratio*outh/cropheight
-            filters.append(f"drawbox=x={x:.2f}:y={yy:.2f}:w={w:.2f}:h={h:.2f}:color=0x3d7eaa@0.6:t=3:enable='gte(t,{start:.6f})*lt(t,{stop:.6f})'")
-    concat.append(f"file 'system-{len(segments)-1}.png'")
-    playlist=work/'timeline.txt';playlist.write_text('\n'.join(concat)+'\n')
-    filterfile=work/'filters.txt';filterfile.write_text(','.join(filters))
-    update(row['id'],status='Encoding video')
-    code=run([ffmpeg,'-v','error','-y','-f','concat','-safe','1','-i',str(playlist),'-i',str(audio),'-/filter:v',str(filterfile),'-r','24','-c:v','libx264','-preset','fast','-crf','20','-pix_fmt','yuv420p','-c:a','aac','-b:a','192k','-t',str(duration),'-movflags','+faststart',str(partial)])
-    if code: raise ValueError('Video encoding failed. See '+log.name)
-    validate_video(partial)
-    if metadata(pathlib.Path(row['path']))[1] != row['hash']:
+    try:
+        with tempfile.TemporaryDirectory(prefix='native-' + row['id'] + '-', dir=DATA) as directory:
+            work = pathlib.Path(directory)
+            source = pathlib.Path(row['path'])
+            score = work / ('source' + source.suffix.lower())
+            shutil.copyfile(source, score)
+            digest = file_fingerprint(score)
+            if metadata(score)[1] != row['hash'] or (row.get('sourceHash') and digest != row['sourceHash']):
+                raise ValueError('The score changed. Refresh the folder and prepare it again.')
+            export_native(MUSE, score, partial, work, log, STOP)
+            validate_video(partial)
+            if file_fingerprint(source) != digest:
+                raise ValueError('The score changed during rendering. Refresh the folder and prepare it again.')
+            partial.replace(target)
+            update(row['id'], video=str(target), videoSource='generated', videoRenderer=RENDERER,
+                   sourceHash=digest, videoSourceHash=digest, status='Ready', error='')
+    finally:
         partial.unlink(missing_ok=True)
-        raise ValueError('The score changed during rendering. Refresh the folder and prepare it again.')
-    partial.replace(target)
-    update(row['id'],video=str(target),status='Ready',error='')
-    shutil.rmtree(work)
 
 def request(url, data=None, headers=None, method=None):
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
@@ -333,6 +287,8 @@ class Handler(BaseHTTPRequestHandler):
                     for r in rows:
                         r['duplicate'] = counts[r['hash']] > 1
                         r['channelCheck']=channel_info(r)
+                        r['needsNative']=needs_native_video(r)
+                        if r.get('video') and r['needsNative'] and r['status']=='Ready': r['status']='Older video · prepare to upgrade'
                 self.respond({'folder':folder,'pieces':rows,'connected':(DATA/'token.json').exists(),'configured':(DATA/'client.json').exists(),'busy':len(BUSY),'stopping':STOP.is_set(),'channel':{k:v for k,v in CHANNEL.items() if k!='videos'},'channelStatus':CHANNEL_STATUS,'channelCount':len(CHANNEL.get('videos',[]))})
             elif url.path == '/api/suggestions':
                 self.respond(SUGGESTIONS)
@@ -452,6 +408,7 @@ class Handler(BaseHTTPRequestHandler):
                         if ident in BUSY: raise ValueError('This piece is already in the queue.')
                         if str(pathlib.Path(row['path']).parent)!=STATE['folder']: raise ValueError('This piece is in another folder.')
                         if metadata(pathlib.Path(row['path']))[1]!=row['hash']: raise ValueError('A score changed. Refresh the folder first.')
+                        if row.get('sourceHash') and file_fingerprint(row['path'])!=row['sourceHash']: raise ValueError('A score’s playback settings changed. Refresh the folder first.')
                         if route.endswith('upload'):
                             month(row['month'])
                             if row.get('youtube'): raise ValueError('A selected piece is already uploaded.')
@@ -459,7 +416,9 @@ class Handler(BaseHTTPRequestHandler):
                             if check['matches'] and not check['reviewed']: raise ValueError('Review the possible YouTube matches in Preview before uploading '+row['title'])
                             if any(p.get('youtube') and p.get('hash') == row['hash'] for p in STATE['pieces'].values()): raise ValueError('An identical copy of a selected piece is already uploaded.')
                             if any(p['hash'] == row['hash'] for p in rows): raise ValueError('Two selected pieces are exact duplicates. Select only one copy.')
-                            if not video_path(row).exists(): raise ValueError('Prepare all selected videos first.')
+                            if needs_native_video(row): raise ValueError('Prepare all selected videos with the native exporter first.')
+                        elif row.get('youtube') or row.get('session'):
+                            raise ValueError('This video has an upload record. Its video is preserved for upload recovery.')
                         rows.append(row)
                     if route.endswith('upload'):
                         if body.get('confirmed') is not True: raise ValueError('Review the batch before uploading.')
@@ -477,9 +436,9 @@ class Handler(BaseHTTPRequestHandler):
                 source=pathlib.Path(body['path']).expanduser().resolve()
                 if source.suffix.lower()!='.mp4': raise ValueError('Choose an MP4 file.')
                 validate_video(source)
-                target=video_path(row)
+                target=VIDEOS / (row['id'] + '-' + row['hash'][:12] + '-attached.mp4')
                 if source!=target.resolve(): shutil.copyfile(source,target)
-                update(row['id'],video=str(target),status='Ready',error='')
+                update(row['id'],video=str(target),videoSource='attached',videoRenderer='attached',videoSourceHash=file_fingerprint(target),status='Ready',error='')
             elif route == '/api/open-score':
                 row=STATE['pieces'][body['id']]
                 subprocess.Popen(['open','-a','MuseScore 4',row['path']])
