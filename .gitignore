@@ -1,0 +1,8 @@
+.data/
+Videos/
+__pycache__/
+.DS_Store
+*.partial.mp4
+Preview.jpg
+Suggestions.jpg
+Upload-order.jpg
